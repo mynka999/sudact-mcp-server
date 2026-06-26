@@ -15,3 +15,8 @@ Thumbs.db
 # Local scratch
 *.log
 *.tmp
+corpus*.jsonl
+
+# Чужая статья (авторское право) — не публикуем
+Статья.pdf
+*.pdf
