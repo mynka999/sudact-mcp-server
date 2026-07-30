@@ -45,34 +45,136 @@ def parse_total(total_str) -> int | None:
     return int(digits) if digits else None
 
 
-def gather_reachable(query, scope, article, date_from, date_to, max_pages=MAX_PAGES):
+def gather_reachable(query, scope, article, date_from, date_to, max_pages=MAX_PAGES,
+                     area="", instance=""):
     """Собирает все достижимые результаты (≤ max_pages*10), отсекая зацикливание."""
     seen, pool, first1 = set(), [], None
     total = None
+    empty_streak = stale_streak = 0
     for page in range(1, max_pages + 1):
         res = server._do_search(
             query=query, scope=scope, article=article, case_number="",
             date_from=date_from, date_to=date_to, page=page, max_per_section=PER_PAGE,
+            area=area, instance=instance,
         )
         if total is None:
             sec = next(iter(res.get("total_found_by_section", {}).values()), None)
             total = parse_total(sec)
         rs = res.get("results", [])
         if not rs:
-            break
+            # ВАЖНО: «меньше 10 на странице» НЕ означает конец выдачи — sudact
+            # регулярно отдаёт неполную страницу (в т.ч. первую), а дальше снова
+            # полные. Останавливаемся только на двух пустых подряд.
+            empty_streak += 1
+            if empty_streak >= 2:
+                break
+            continue
+        empty_streak = 0
         if page == 1:
             first1 = rs[0]["doc_id"]
-        elif rs[0]["doc_id"] == first1:   # страница зациклилась на первую — предел
+        elif first1 and rs[0]["doc_id"] == first1:  # выдача зациклилась — предел
             break
         new = [r for r in rs if r["doc_id"] not in seen]
-        if not new:
-            break
-        for r in new:
-            seen.add(r["doc_id"])
-            pool.append(r)
-        if len(rs) < PER_PAGE:
+        if new:
+            stale_streak = 0
+            for r in new:
+                seen.add(r["doc_id"])
+                pool.append(r)
+        else:
+            stale_streak += 1
+            if stale_streak >= 2:
+                break
+        if total and len(pool) >= total:     # собрали всё, что обещал сайт
             break
     return pool, total
+
+
+CAP = MAX_PAGES * PER_PAGE          # практический предел выдачи sudact (~500)
+
+
+def regions_for(scope: str) -> list[str]:
+    """Названия регионов (для арбитража — судебных округов) из справочника."""
+    d = server.DICTS.get(scope, {})
+    table = d.get("area") or d.get("region") or {}
+    return sorted(table)
+
+
+def collect_partitioned(query, scope, article, n, seed, cascade, years, log=print,
+                        max_regions=0):
+    """Партиционирование по регионам (+ каскад инстанция × год для упёршихся).
+
+    Зачем: sudact отдаёт максимум ~500 результатов на ОДИН запрос, поэтому «весь
+    корпус» недостижим напрямую. Но фильтр по региону режет корпус на 85 частей,
+    каждая со своим лимитом — и на узких запросах становится достижим целиком.
+    Если регион всё равно упирается в лимит, дробим его по инстанциям, а затем
+    по годам. Всё, что осталось за лимитом, честно попадает в отчёт (capped).
+    """
+    rng = random.Random(seed)
+    parts: list[dict] = []          # {label, pool, total, capped}
+    regs = regions_for(scope)
+    if not regs:
+        return [], {"error": f"Для раздела «{scope}» нет справочника регионов "
+                             f"(обновите sudact_dicts.json: py build_dicts.py)."}
+    regions_total = len(regs)
+    if max_regions and max_regions < len(regs):
+        regs = regs[:max_regions]
+
+    def grab(label, **flt):
+        pool, total = gather_reachable(query, scope, article, flt.pop("date_from", ""),
+                                       flt.pop("date_to", ""), **flt)
+        capped = bool(total and total > len(pool) and len(pool) >= CAP - PER_PAGE)
+        return {"label": label, "pool": pool, "total": total or 0, "capped": capped}
+
+    for i, reg in enumerate(regs, 1):
+        p = grab(reg, area=reg)
+        log(f"  [{i}/{len(regs)}] {reg}: найдено {p['total']}, достижимо {len(p['pool'])}"
+            + (" — УПЁРЛОСЬ В ЛИМИТ" if p["capped"] else ""))
+        if p["capped"] and cascade:
+            # дробим регион по инстанциям, при необходимости — ещё и по годам
+            for inst in ("первая", "апелляция", "кассация"):
+                q = grab(f"{reg} / {inst}", area=reg, instance=inst)
+                if q["capped"] and years:
+                    for y in years:
+                        parts.append(grab(f"{reg} / {inst} / {y}", area=reg, instance=inst,
+                                          date_from=f"01.01.{y}", date_to=f"31.12.{y}"))
+                else:
+                    parts.append(q)
+        else:
+            parts.append(p)
+
+    # дедуп между партициями (одно дело может попасть в несколько окон)
+    seen: set[str] = set()
+    for p in parts:
+        uniq = []
+        for r in p["pool"]:
+            if r["doc_id"] not in seen:
+                seen.add(r["doc_id"])
+                uniq.append(r)
+        p["pool"] = uniq
+
+    # пропорциональная аллокация выборки по объёму партиции
+    grand = sum(p["total"] for p in parts) or 1
+    selected: list[dict] = []
+    for p in parts:
+        if not p["pool"]:
+            continue
+        quota = min(len(p["pool"]), max(1, round(n * p["total"] / grand)))
+        selected.extend(rng.sample(p["pool"], quota))
+    if len(selected) > n:
+        selected = rng.sample(selected, n)
+
+    report = {
+        "mode": "by-region", "scope": scope, "seed": seed,
+        "partitions": len(parts),
+        "regions_scanned": len(regs),
+        "regions_available": regions_total,
+        "regions_skipped_by_limit": max(0, regions_total - len(regs)),
+        "total_found_sum": sum(p["total"] for p in parts),
+        "reachable_sum": len(seen),
+        "capped_partitions": [p["label"] for p in parts if p["capped"]],
+        "cascade": bool(cascade),
+    }
+    return selected, report
 
 
 # Резолютивные глаголы (в т.ч. в «разрядку»: «П Р И Г О В О Р И Л»).
@@ -132,7 +234,14 @@ def main():
     ap.add_argument("--query", default="")
     ap.add_argument("--article", default="")
     ap.add_argument("--scope", default="regular")
-    ap.add_argument("--mode", choices=["random", "stratified"], default="random")
+    ap.add_argument("--mode", choices=["random", "stratified", "by-region"], default="random")
+    ap.add_argument("--cascade", action="store_true",
+                    help="by-region: упёршиеся регионы дробить по инстанциям и годам")
+    ap.add_argument("--cascade-years", default="",
+                    help="годы для каскада, напр. '2023,2024,2025'")
+    ap.add_argument("--max-regions", type=int, default=0,
+                    help="by-region: взять только первые N регионов (для быстрых пилотов; "
+                         "0 = все). Ограничение попадает в отчёт.")
     ap.add_argument("--windows", default="",
                     help="для stratified: годы '2024,2025,2026' или диапазоны "
                          "'2024-01-01:2024-06-30,2024-07-01:2024-12-31'")
@@ -162,7 +271,19 @@ def main():
     }
     selected = []
 
-    if args.mode == "random":
+    if args.mode == "by-region":
+        years = [y.strip() for y in args.cascade_years.split(",") if y.strip()]
+        selected, rep = collect_partitioned(
+            args.query, args.scope, args.article, args.n, args.seed,
+            args.cascade, years, log=lambda m: print(m, file=sys.stderr),
+            max_regions=args.max_regions)
+        if isinstance(rep, dict) and rep.get("error"):
+            print(json.dumps(rep, ensure_ascii=False, indent=2))
+            return
+        report.update(rep)
+        report["total_found_overall"] = rep.get("total_found_sum")
+        report["reachable_overall"] = rep.get("reachable_sum")
+    elif args.mode == "random":
         pool, total = gather_reachable(
             args.query, args.scope, args.article, args.date_from, args.date_to)
         report["total_found_overall"] = total

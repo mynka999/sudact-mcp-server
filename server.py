@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import html
+import json
+import pathlib
 import re
 import time
 import urllib.parse
@@ -39,7 +41,61 @@ SECTIONS = {
 # Разделы, относящиеся к судебной практике (для scope="all").
 PRACTICE_SECTIONS = ["vsrf", "arbitral", "regular", "magistrate"]
 
+# Какие фильтры поддерживает каждый раздел и как называется параметр на сайте.
+# ВАЖНО: набор полей и справочники в разделах РАЗНЫЕ (проверено по формам):
+#   regular    — area (85 регионов), court, judge, workflow_stage (инстанция)
+#   magistrate — area (73 региона, ДРУГИЕ id!), court, judge; инстанции нет
+#   arbitral   — region (10 судебных ОКРУГОВ, не регионов!), court, judge
+#   vsrf       — только judge
+# Неподдерживаемые фильтры не отправляем и честно сообщаем об этом в ответе.
+SECTION_FILTERS: dict[str, dict[str, str]] = {
+    "regular": {"area": "area", "court": "court", "judge": "judge",
+                "instance": "workflow_stage"},
+    "magistrate": {"area": "area", "court": "court", "judge": "judge"},
+    "arbitral": {"area": "region", "court": "court", "judge": "judge"},
+    "vsrf": {"judge": "judge"},
+    "law": {},
+}
+
+# Справочники значений (регионы/округа/инстанции), собираются build_dicts.py.
+try:
+    DICTS: dict[str, dict[str, dict[str, str]]] = json.loads(
+        pathlib.Path(__file__).with_name("sudact_dicts.json").read_text(encoding="utf-8")
+    )
+except Exception:  # без файла поиск по названию недоступен, но числовые id работают
+    DICTS = {}
+
 mcp = FastMCP("sudact")
+
+
+def _resolve_dict_value(section: str, field: str, value: str) -> tuple[str | None, str | None]:
+    """Название -> id по справочнику раздела. Возвращает (id, ошибка).
+
+    Принимает и человеческое название («Москва», «апелляция»), и готовый id.
+    """
+    value = (value or "").strip()
+    if not value:
+        return None, None
+    if value.isdigit():                     # уже id — отдаём как есть
+        return value, None
+    table = DICTS.get(section, {}).get(field, {})
+    if not table:
+        return None, (f"Для раздела «{SECTIONS.get(section, section)}» нет справочника "
+                      f"«{field}» — укажите числовой id или обновите sudact_dicts.json "
+                      f"(py build_dicts.py).")
+    low = value.lower()
+    exact = [v for n, v in table.items() if n.lower() == low]
+    if exact:
+        return exact[0], None
+    part = {n: v for n, v in table.items() if low in n.lower()}
+    if len(part) == 1:
+        return next(iter(part.values())), None
+    if len(part) > 1:
+        return None, (f"Неоднозначное значение «{value}» для «{field}»: подходит "
+                      f"{', '.join(sorted(part)[:8])}. Уточните.")
+    return None, (f"Не найдено «{value}» в справочнике «{field}» раздела "
+                  f"«{SECTIONS.get(section, section)}». Примеры допустимых: "
+                  f"{', '.join(sorted(table)[:8])}.")
 
 
 # --------------------------------------------------------------------------- #
@@ -84,7 +140,12 @@ def _build_query(
     date_from: str = "",
     date_to: str = "",
     page: int = 1,
-) -> str:
+    area: str = "",
+    court: str = "",
+    judge: str = "",
+    instance: str = "",
+) -> tuple[str, list[str], str | None]:
+    """Собирает query string. Возвращает (qs, пропущенные_фильтры, ошибка)."""
     p: dict[str, str] = {}
     if text:
         p[f"{section}-txt"] = text
@@ -96,9 +157,28 @@ def _build_query(
         p[f"{section}-date_from"] = date_from
     if date_to:
         p[f"{section}-date_to"] = date_to
+
+    supported = SECTION_FILTERS.get(section, {})
+    skipped: list[str] = []
+    for logical, value in (("area", area), ("court", court),
+                           ("judge", judge), ("instance", instance)):
+        if not value:
+            continue
+        param = supported.get(logical)
+        if not param:                       # раздел такого фильтра не имеет
+            skipped.append(logical)
+            continue
+        if logical in ("area", "instance"):  # значения из справочника
+            resolved, err = _resolve_dict_value(section, param, value)
+            if err:
+                return "", skipped, err
+            p[f"{section}-{param}"] = resolved or value
+        else:                                # court/judge — свободный текст
+            p[f"{section}-{param}"] = value
+
     if page and page > 1:
         p["page"] = str(page)
-    return urllib.parse.urlencode(p)
+    return urllib.parse.urlencode(p), skipped, None
 
 
 def _search_section(client: httpx.Client, section: str, qs: str, max_wait: float = 20.0):
@@ -177,6 +257,10 @@ def _do_search(
     date_to: str,
     page: int,
     max_per_section: int,
+    area: str = "",
+    court: str = "",
+    judge: str = "",
+    instance: str = "",
 ) -> dict:
     scope = (scope or "all").strip().lower()
     if scope == "all":
@@ -193,9 +277,10 @@ def _do_search(
 
     all_results: list[dict] = []
     per_section: dict[str, str | int | None] = {}
+    skipped_by_section: dict[str, list[str]] = {}
     with _client() as client:
         for section in sections:
-            qs = _build_query(
+            qs, skipped, err = _build_query(
                 section,
                 text=query,
                 article=article,
@@ -203,7 +288,15 @@ def _do_search(
                 date_from=date_from,
                 date_to=date_to,
                 page=page,
+                area=area,
+                court=court,
+                judge=judge,
+                instance=instance,
             )
+            if err:
+                return {"error": err}
+            if skipped:
+                skipped_by_section[SECTIONS.get(section, section)] = skipped
             content, total = _search_section(client, section, qs)
             found = _parse_results(content, section, max_per_section)
             if isinstance(total, str):
@@ -211,18 +304,26 @@ def _do_search(
             per_section[section] = total if total is not None else (len(found) if content else "—")
             all_results.extend(found)
 
-    return {
+    out = {
         "query": query,
         "article": article,
         "case_number": case_number,
         "scope": scope,
         "page": page,
+        "filters": {k: v for k, v in
+                    (("area", area), ("court", court), ("judge", judge),
+                     ("instance", instance)) if v},
         "total_found_by_section": {SECTIONS[s]: per_section.get(s) for s in sections},
         "returned": len(all_results),
         "results": all_results,
         "note": "Источник: sudact.ru (СудАкт). total_found — общее число совпадений в разделе, "
         "results — текущая страница (по умолчанию 10 на раздел).",
     }
+    if skipped_by_section:
+        out["filters_ignored"] = skipped_by_section
+        out["note"] += (" ВНИМАНИЕ: часть фильтров не поддерживается некоторыми разделами "
+                        "и была проигнорирована — см. filters_ignored.")
+    return out
 
 
 def _do_get(url_or_id: str, section: str) -> dict:
@@ -286,6 +387,10 @@ def search_court_practice(
     date_to: str = "",
     page: int = 1,
     max_per_section: int = 10,
+    area: str = "",
+    court: str = "",
+    judge: str = "",
+    instance: str = "",
 ) -> dict:
     """Поиск судебной практики РФ на sudact.ru.
 
@@ -299,13 +404,28 @@ def search_court_practice(
         date_to: дата по (ДД.ММ.ГГГГ).
         page: страница выдачи (по 10 результатов на раздел).
         max_per_section: сколько результатов вернуть из каждого раздела.
+        area: регион по-русски («Москва», «Алтайский край») или его id. Для
+            арбитража — судебный ОКРУГ («Волго-Вятский»). У ВС РФ не работает.
+        court: НАЗВАНИЕ СУДА, нужно ТОЧНОЕ, со скобками региона, напр.
+            "Стерлитамакский городской суд (Республика Башкортостан)".
+            Частичное название не сработает — сперва вызовите find_court_name.
+        judge: фамилия судьи (достаточно фамилии), напр. "Акбашева".
+        instance: инстанция — «первая», «апелляция», «кассация», «пересмотр»,
+            «надзор» или id. Поддерживается только разделом СОЮ (regular).
 
     Returns:
         dict со списком найденных решений: название, суд, ссылка, сниппет.
         Для полного текста используйте get_court_decision с url или doc_id.
+        Если фильтр не поддержан разделом — он будет проигнорирован, а в ответе
+        появится ключ filters_ignored.
+
+    Полезно: фильтр area заметно расширяет доступную глубину выдачи (sudact
+    отдаёт максимум ~500 результатов на один запрос), поэтому для сбора больших
+    корпусов лучше идти по регионам — см. stat_corpus.py --mode by-region.
     """
     return _do_search(
-        query, scope, article, case_number, date_from, date_to, page, max_per_section
+        query, scope, article, case_number, date_from, date_to, page,
+        max_per_section, area=area, court=court, judge=judge, instance=instance,
     )
 
 
@@ -323,6 +443,73 @@ def get_court_decision(url_or_id: str, section: str = "regular") -> dict:
         dict с заголовком, судом, полным текстом решения и ссылкой.
     """
     return _do_get(url_or_id, section)
+
+
+def _do_find_court(name: str, scope: str, area: str) -> dict:
+    """Подбирает ТОЧНЫЕ названия судов по частичному.
+
+    У sudact нет ни автокомплита, ни индекса судов, а фильтр `court` требует
+    точного названия со скобками. Поэтому ищем решения, в тексте которых
+    упоминается искомое название, и собираем канонические названия судов из
+    самой выдачи (поле b-justice), отсекая суффикс категории (« - Уголовное»).
+    """
+    name = (name or "").strip()
+    if not name:
+        return {"error": "Укажите хотя бы часть названия суда."}
+    scope = (scope or "regular").strip().lower()
+    sections = PRACTICE_SECTIONS if scope == "all" else [scope]
+    if scope != "all" and scope not in SECTIONS:
+        return {"error": f"Неизвестный раздел scope='{scope}'."}
+
+    found: dict[str, dict] = {}
+    with _client() as client:
+        for section in sections:
+            qs, _sk, err = _build_query(section, text=name, area=area, page=1)
+            if err:
+                return {"error": err}
+            content, _total = _search_section(client, section, qs)
+            for r in _parse_results(content, section, 30):
+                raw = (r.get("court") or "").strip()
+                if not raw:
+                    continue
+                # «Ленинский районный суд (Пермский край) - Уголовное» -> без хвоста
+                canon = re.split(r"\s+[-–]\s+(?=[А-ЯЁ])", raw)[0].strip()
+                if not canon:
+                    continue
+                item = found.setdefault(
+                    canon, {"court_name": canon, "section": section,
+                            "section_name": SECTIONS.get(section, section), "seen": 0})
+                item["seen"] += 1
+
+    matches = sorted(found.values(), key=lambda x: -x["seen"])
+    exact_hint = [m for m in matches if name.lower() in m["court_name"].lower()]
+    return {
+        "query": name,
+        "candidates": exact_hint or matches,
+        "note": ("Передайте court_name в search_court_practice(court=...) БЕЗ изменений — "
+                 "фильтр требует точного совпадения. Список собран из выдачи sudact, "
+                 "поэтому он не является полным справочником судов."),
+    }
+
+
+@mcp.tool()
+def find_court_name(name: str, scope: str = "regular", area: str = "") -> dict:
+    """Подобрать ТОЧНОЕ название суда для фильтра `court`.
+
+    Фильтр court в search_court_practice требует точного названия со скобками
+    региона; частичное («Стерлитамакский») не работает. Этот инструмент
+    подбирает канонические названия по части имени.
+
+    Args:
+        name: часть названия суда, напр. "Стерлитамакский городской".
+        scope: раздел поиска (regular|arbitral|magistrate|vsrf|all).
+        area: опционально сузить регионом («Республика Башкортостан»).
+
+    Returns:
+        dict со списком кандидатов; поле court_name подставляйте в
+        search_court_practice(court=...) без изменений.
+    """
+    return _do_find_court(name, scope, area)
 
 
 if __name__ == "__main__":

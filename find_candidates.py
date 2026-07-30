@@ -35,6 +35,10 @@ def main():
     ap.add_argument("--date-from", default="")
     ap.add_argument("--date-to", default="")
     ap.add_argument("--per", type=int, default=12, help="результатов на угол на раздел")
+    ap.add_argument("--area", default="", help="регион («Москва»); у арбитража — округ")
+    ap.add_argument("--court", default="", help="ТОЧНОЕ название суда (см. find_court_name)")
+    ap.add_argument("--judge", default="", help="фамилия судьи")
+    ap.add_argument("--instance", default="", help="первая|апелляция|кассация (только СОЮ)")
     ap.add_argument("--out", default="candidates.jsonl")
     args = ap.parse_args()
 
@@ -48,7 +52,11 @@ def main():
             res = server._do_search(
                 query=q, scope=scope, article=args.article, case_number=args.case_number,
                 date_from=args.date_from, date_to=args.date_to, page=1, max_per_section=args.per,
+                area=args.area, court=args.court, judge=args.judge, instance=args.instance,
             )
+            if res.get("error"):
+                print(json.dumps(res, ensure_ascii=False, indent=2))
+                return
             rows = res.get("results", [])
             per_angle.append({"scope": scope, "query": q, "returned": len(rows)})
             for r in rows:
@@ -70,6 +78,8 @@ def main():
 
     print(json.dumps({
         "queries": queries, "article": args.article, "scopes": scopes,
+        "filters": {k: v for k, v in (("area", args.area), ("court", args.court),
+                                      ("judge", args.judge), ("instance", args.instance)) if v},
         "per_angle": per_angle, "unique_candidates": len(out), "out": args.out,
     }, ensure_ascii=False, indent=2))
 
