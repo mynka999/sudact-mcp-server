@@ -125,21 +125,33 @@ def collect_partitioned(query, scope, article, n, seed, cascade, years, log=prin
         capped = bool(total and total > len(pool) and len(pool) >= CAP - PER_PAGE)
         return {"label": label, "pool": pool, "total": total or 0, "capped": capped}
 
+    # Регионы/окна, которые упёрлись в лимит и были раздроблены каскадом.
+    # Фиксируем ОТДЕЛЬНО: после дробления исходная партиция в parts не попадает,
+    # поэтому в capped_partitions её не видно — без этого потолок оказался бы
+    # «молчаливым», а отчёт обязан показывать, где охват был неполным.
+    cascaded_regions: list[str] = []
+    cascaded_windows: list[str] = []
+    capped_not_split: list[str] = []
+
     for i, reg in enumerate(regs, 1):
         p = grab(reg, area=reg)
         log(f"  [{i}/{len(regs)}] {reg}: найдено {p['total']}, достижимо {len(p['pool'])}"
             + (" — УПЁРЛОСЬ В ЛИМИТ" if p["capped"] else ""))
         if p["capped"] and cascade:
+            cascaded_regions.append(f"{reg} (найдено {p['total']}, отдано {len(p['pool'])})")
             # дробим регион по инстанциям, при необходимости — ещё и по годам
             for inst in ("первая", "апелляция", "кассация"):
                 q = grab(f"{reg} / {inst}", area=reg, instance=inst)
                 if q["capped"] and years:
+                    cascaded_windows.append(f"{reg} / {inst}")
                     for y in years:
                         parts.append(grab(f"{reg} / {inst} / {y}", area=reg, instance=inst,
                                           date_from=f"01.01.{y}", date_to=f"31.12.{y}"))
                 else:
                     parts.append(q)
         else:
+            if p["capped"]:
+                capped_not_split.append(f"{reg} (найдено {p['total']}, отдано {len(p['pool'])})")
             parts.append(p)
 
     # дедуп между партициями (одно дело может попасть в несколько окон)
@@ -172,6 +184,11 @@ def collect_partitioned(query, scope, article, n, seed, cascade, years, log=prin
         "total_found_sum": sum(p["total"] for p in parts),
         "reachable_sum": len(seen),
         "capped_partitions": [p["label"] for p in parts if p["capped"]],
+        "cascaded_regions": cascaded_regions,          # упёрлись → раздроблены по инстанциям
+        "cascaded_windows": cascaded_windows,          # инстанция упёрлась → раздроблена по годам
+        "capped_not_split": capped_not_split,          # упёрлись и НЕ раздроблены (--cascade выключен)
+        "coverage_pct": (round(100 * len(seen) / sum(p["total"] for p in parts))
+                         if sum(p["total"] for p in parts) else None),
         "cascade": bool(cascade),
     }
     return selected, report
