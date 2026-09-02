@@ -4,7 +4,7 @@
 
 Официального API у СудАкта нет, поэтому сервер работает как обычный браузер:
 шлёт User-Agent, держит сессионную куку и опрашивает асинхронный поиск сайта
-(/<раздел>/doc_ajax/), после чего разбирает HTML выдачи и текст решения.
+(/<раздел>/?<раздел>-txt=...), после чего разбирает HTML выдачи и текст решения.
 
 Инструменты:
   - search_court_practice — поиск решений по тексту / статье / номеру дела
@@ -182,41 +182,42 @@ def _build_query(
 
 
 def _search_section(client: httpx.Client, section: str, qs: str, max_wait: float = 20.0):
-    """Ставит поисковую задачу и опрашивает её до готовности.
+    """Запрашивает страницу поиска раздела и возвращает (html, total_found).
 
-    Возвращает (content_html, total_found) либо (None, None) при таймауте.
+    Историческая справка: до августа 2026 sudact искал асинхронно — прайминг
+    /{section}/doc/ и опрос /{section}/doc_ajax/ до search_status="finished".
+    С конца августа 2026 doc_ajax отдаёт HTTP 500: сайт перешёл на обычную
+    синхронную выдачу, результаты приходят сразу в HTML по /{section}/?{qs}.
     """
-    doc_path = f"/{section}/doc/?{qs}"
-    # Прайминг: получаем сессионную куку и регистрируем поисковую задачу.
-    client.get(doc_path)
-    ajax_path = f"/{section}/doc_ajax/?{qs}"
-    deadline = time.monotonic() + max_wait
-    while time.monotonic() < deadline:
-        r = client.get(
-            ajax_path,
-            headers={
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": f"{BASE}{doc_path}",
-            },
-        )
-        try:
-            data = r.json()
-        except Exception:
-            time.sleep(0.8)
-            continue
-        status = data.get("search_status") or data.get("status")
-        if status == "finished" and data.get("content"):
-            return data["content"], data.get("total_found")
-        time.sleep(0.8)
-    return None, None
+    path = f"/{section}/?{qs}"
+    try:
+        r = client.get(path)
+    except Exception:
+        return None, None
+    if r.status_code != 200:
+        return None, None
+    text = r.text
+    total = None
+    m = re.search(r"(?:Найдено|найдено)[^0-9<]{0,40}([0-9][0-9  ]*)", text)
+    if m:
+        digits = re.sub(r"[^0-9]", "", m.group(1))
+        if digits:
+            total = int(digits)
+    return text, total
 
 
 def _parse_results(content: str, section: str, limit: int) -> list[dict]:
     results: list[dict] = []
     if not content:
         return results
-    m = re.search(r'<ul class="results">(.*?)</ul>', content, re.S)
-    ul = m.group(1) if m else content
+    # Класс контейнера менялся: "results" -> "results2" (рядом живёт служебный
+    # "results d" без карточек). Берём блок, где реально есть карточки (<h4>),
+    # иначе разбираем весь HTML — так переживём следующий редизайн.
+    ul = content
+    for _m in re.finditer(r'<ul class="results[^"]*">(.*?)</ul>', content, re.S):
+        if "<h4>" in _m.group(1):
+            ul = _m.group(1)
+            break
     for li in re.findall(r"<li.*?</li>", ul, re.S):
         a = re.search(r"<h4>.*?<a href=\"([^\"]+)\"[^>]*>(.*?)</a>", li, re.S)
         if not a:
