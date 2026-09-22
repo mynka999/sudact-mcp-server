@@ -4,7 +4,7 @@
 
 Официального API у СудАкта нет, поэтому сервер работает как обычный браузер:
 шлёт User-Agent, держит сессионную куку и опрашивает асинхронный поиск сайта
-(/<раздел>/?<раздел>-txt=...), после чего разбирает HTML выдачи и текст решения.
+(/<раздел>/doc_ajax/), после чего разбирает HTML выдачи и текст решения.
 
 Инструменты:
   - search_court_practice — поиск решений по тексту / статье / номеру дела
@@ -182,13 +182,66 @@ def _build_query(
 
 
 def _search_section(client: httpx.Client, section: str, qs: str, max_wait: float = 20.0):
-    """Запрашивает страницу поиска раздела и возвращает (html, total_found).
+    """Возвращает (html_выдачи, total_found) — пробует обе схемы поиска сайта.
 
-    Историческая справка: до августа 2026 sudact искал асинхронно — прайминг
-    /{section}/doc/ и опрос /{section}/doc_ajax/ до search_status="finished".
-    С конца августа 2026 doc_ajax отдаёт HTTP 500: сайт перешёл на обычную
-    синхронную выдачу, результаты приходят сразу в HTML по /{section}/?{qs}.
+    Историческая справка: sudact дважды менял схему.
+      * до 08.2026 — асинхронная: прайминг /{section}/doc/?{qs}, затем опрос
+        /{section}/doc_ajax/?{qs} до search_status == "finished";
+      * 09.2026 — doc_ajax стал отдавать HTTP 500, выдача приходила сразу
+        в HTML по /{section}/?{qs};
+      * 22.09.2026 — сайт вернулся к асинхронной схеме, doc_ajax снова жив.
+    Поэтому сперва идём асинхронным путём, а при его отказе падаем на
+    синхронный: следующий разворот сайта туда-обратно переживём без правки.
+
+    ВАЖНО: /{section}/?{qs} в отрыве от асинхронного поиска — это ЛЕНДИНГ
+    раздела. Он молча игнорирует запрос и отдаёт ленту свежих документов,
+    то есть ошибка выглядит как успешный ответ. Поэтому синхронный путь —
+    строго запасной, а не основной.
     """
+    content, total = _search_async(client, section, qs, max_wait)
+    if content is not None:
+        return content, total
+    return _search_sync(client, section, qs)
+
+
+def _search_async(client: httpx.Client, section: str, qs: str, max_wait: float):
+    """Прайминг + опрос doc_ajax. Отдаёт (None, None), если схема недоступна."""
+    path = f"/{section}/doc/?{qs}"
+    try:
+        if client.get(path).status_code != 200:
+            return None, None
+    except Exception:
+        return None, None
+
+    ref = urllib.parse.urljoin(BASE, path)
+    deadline = time.monotonic() + max_wait
+    delay = 0.4
+    while True:
+        try:
+            r = client.get(
+                f"/{section}/doc_ajax/?{qs}&_={int(time.time() * 1000)}",
+                headers={"X-Requested-With": "XMLHttpRequest", "Referer": ref},
+            )
+        except Exception:
+            return None, None
+        if r.status_code != 200:      # схему снова отключили — на запасной путь
+            return None, None
+        try:
+            data = r.json()
+        except Exception:
+            return None, None
+        content = data.get("content")
+        if content:
+            return content, data.get("total_found")
+        # search_status == "finished" без content — поиск отработал вхолостую.
+        if data.get("search_status") == "finished" or time.monotonic() >= deadline:
+            return "", data.get("total_found")
+        time.sleep(delay)
+        delay = min(delay * 1.2, 3.0)
+
+
+def _search_sync(client: httpx.Client, section: str, qs: str):
+    """Запасной путь: выдача приходит сразу в HTML страницы раздела."""
     path = f"/{section}/?{qs}"
     try:
         r = client.get(path)
@@ -228,10 +281,13 @@ def _parse_results(content: str, section: str, limit: int) -> list[dict]:
         doc_id = id_m.group(1) if id_m else ""
         court_m = re.search(r'<div class="b-justice">(.*?)</div>', li, re.S)
         court = _strip_tags(court_m.group(1)) if court_m else ""
-        # Сниппет = текст элемента без заголовка и названия суда.
+        # Сниппет = текст элемента без заголовка, названия суда и порядкового
+        # номера карточки. Номер живёт в <span class="numb">1.</span> — без
+        # его отсечения сниппетом становится именно он.
         body = re.sub(r"(?s)<h4>.*?</h4>", " ", li)
         body = re.sub(r'(?s)<div class="b-justice">.*?</div>', " ", body)
         body = re.sub(r'(?s)<div class="bookmark.*?</div>\s*</div>', " ", body)
+        body = re.sub(r'(?s)<span class="numb">.*?</span>', " ", body)
         snippet = _strip_tags(body)
         results.append(
             {
